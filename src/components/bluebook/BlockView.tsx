@@ -109,6 +109,10 @@ function ParagraphView({
           style={{ width: img.w * CROP_SCALE, height: img.h * CROP_SCALE, verticalAlign: -img.drop * CROP_SCALE }}
         />
       </span>
+    ) : found.run.script ? (
+      <span key={start} data-off={start} className={cn(style, 'relative text-[0.7em]', found.run.script === 'sup' ? '-top-[0.5em]' : 'top-[0.25em]')}>
+        {text}
+      </span>
     ) : (
       <span key={start} data-off={start} className={style || undefined}>
         {text}
@@ -130,7 +134,11 @@ function ParagraphView({
       </mark>
     )
   })
-  return <p data-pid={p.id}>{pieces}</p>
+  return (
+    <p data-pid={p.id} className={p.indent ? 'pl-6 whitespace-pre-line' : undefined}>
+      {pieces}
+    </p>
+  )
 }
 
 /** Maps the current DOM selection inside `root` to per-paragraph character ranges. */

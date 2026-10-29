@@ -1,7 +1,7 @@
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import type { Block, Choice, Crop, InlineImage, Paragraph, Question, Run } from '../types'
-import { groupLines, toItems, type Line, type TItem } from './lines'
+import type { Block, Choice, Crop, InlineImage, Paragraph, Question, Run, SectionKind } from '../types'
+import { groupLines, isWordPerItem, toItems, type Line, type RawItem, type TItem } from './lines'
 import { buildSkeletons, ParseError, type PageInfo, type QuestionSkeleton, type Segment } from './structure'
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
@@ -23,14 +23,16 @@ export async function parseQuestionBankPdf(
   const doc = await task.promise
   try {
     const pages: PageInfo[] = []
-    const lines: Line[] = []
+    const raws: { items: RawItem[]; top: number; left: number }[] = []
     for (let p = 1; p <= doc.numPages; p++) {
       const page = await doc.getPage(p)
-      const [x0, , x1, y1] = page.view
-      pages.push({ width: x1 - page.view[0], height: y1 - page.view[1] })
+      const [x0, y0, x1, y1] = page.view
+      pages.push({ width: x1 - x0, height: y1 - y0 })
       const tc = await page.getTextContent()
-      lines.push(...groupLines(toItems(tc.items as never, y1, x0), p - 1))
+      raws.push({ items: tc.items.flatMap((i) => ('str' in i ? [i] : [])), top: y1, left: x0 })
     }
+    const wordPerItem = isWordPerItem(raws.flatMap((r) => r.items))
+    const lines = raws.flatMap((r, p) => groupLines(toItems(r.items, r.top, r.left, wordPerItem), p))
     const skeletons = buildSkeletons(lines, pages)
 
     // Raster pass, one page at a time so only one big canvas is alive.
@@ -162,10 +164,12 @@ function crop(r: PageRaster, rect: Rect, align: Crop['align']): Crop | null {
   let y0 = clamp(Math.floor(rect.top * RS), 0, r.height)
   let y1 = clamp(Math.ceil(rect.bottom * RS), 0, r.height)
   let minX = x1, maxX = -1, minY = y1, maxY = -1
+  // Figures can sit in a faint grey container box; trim to real ink so the figure isn't shrunk.
+  const inkLevel = align === 'center' ? 200 : 235
   for (let y = y0; y < y1; y++) {
     const base = y * r.width
     for (let x = x0; x < x1; x++) {
-      if (r.lum[base + x] < 235) {
+      if (r.lum[base + x] < inkLevel) {
         if (x < minX) minX = x
         if (x > maxX) maxX = x
         if (y < minY) minY = y
@@ -186,6 +190,7 @@ function crop(r: PageRaster, rect: Rect, align: Crop['align']): Crop | null {
 
 interface Ctx {
   qid: string
+  section: SectionKind
   regularFont: string | null
   counter: { n: number }
 }
@@ -196,26 +201,66 @@ interface Ctx {
  *  - ink that isn't on a text line (charts, tables, display equations) becomes a figure image,
  *    together with the labels that sit inside or right next to it.
  */
+/**
+ * Thin vertical bars (a blockquote's accent bar, table column borders) are never text or
+ * inline math. Mask them so they don't turn into stray inline images; crops still show them.
+ */
+function maskVerticalBars(r: PageRaster, rect: Rect, minLenPt: number) {
+  const x0 = clamp(Math.floor(rect.left * RS), 0, r.width)
+  const x1 = clamp(Math.ceil(rect.right * RS), 0, r.width)
+  const y0 = clamp(Math.floor(rect.top * RS), 0, r.height)
+  const y1 = clamp(Math.ceil(rect.bottom * RS), 0, r.height)
+  const minLen = minLenPt * RS
+  for (let x = x0; x < x1; x++) {
+    let start = -1
+    for (let y = y0; y <= y1; y++) {
+      const ink = y < y1 && isInk(r, y * r.width + x)
+      if (ink && start < 0) start = y
+      if (!ink && start >= 0) {
+        if (y - start >= minLen) for (let k = start; k < y; k++) r.textMask[k * r.width + x] = 1
+        start = -1
+      }
+    }
+  }
+}
+
+/** Where a line's own text starts inside the region (a stripped "A." label doesn't count). */
+function textX0(l: Line, rect: Rect): number {
+  const first = l.items.find((i) => !i.isSpace && i.x >= rect.left - 1)
+  return first ? first.x : l.x0
+}
+
+/**
+ * Turns a region of the page into blocks:
+ *  - text lines become paragraphs, with inline math cut out as small images;
+ *  - ink that isn't on a text line (charts, tables, display equations) becomes a figure image,
+ *    together with the labels and captions that sit inside or right next to it.
+ */
 function analyzeRegion(r: PageRaster, rect: Rect, lines: Line[], ctx: Ctx): Block[] {
   const sorted = [...lines].sort((a, b) => a.baseline - b.baseline)
+  const size = sorted.length ? Math.min(...sorted.map((l) => l.size)) : 10
   const zone = (l: Line, ext: number) => ({ top: l.top - l.size * (0.15 + ext), bottom: l.bottom + l.size * (0.05 + ext) })
+  maskVerticalBars(r, rect, size * 2.5)
 
   // 1. Bands of non-text ink.
   const { y0, counts, runs } = rowInk(r, rect)
   const raw: { top: number; bottom: number; ink: number; offLine: number; rule: boolean }[] = []
-  // A long horizontal rule (box edge, table border) is never inline math.
-  const ruleLen = (rect.right - rect.left) * RS * 0.25
+  // Long horizontal rules are box edges or table borders, never inline math. Fraction bars
+  // sit inside a text line, so a shorter rule only counts when it lies between lines.
+  const longRule = (rect.right - rect.left) * RS * 0.25
+  const shortRule = 40 * RS
   const gap = BAND_GAP_PT * RS
-  const nearLine = (yPt: number) => sorted.some((l) => {
-    const z = zone(l, 0.7)
-    return yPt >= z.top && yPt <= z.bottom
-  })
+  const inZone = (yPt: number, ext: number) =>
+    sorted.some((l) => {
+      const z = zone(l, ext)
+      return yPt >= z.top && yPt <= z.bottom
+    })
   for (let i = 0; i < counts.length; i++) {
     if (counts[i] < INK_ROW_MIN) continue
     const yPt = (y0 + i) / RS
-    const off = nearLine(yPt) ? 0 : 1
+    const off = inZone(yPt, 0.7) ? 0 : 1
+    const rule = runs[i] > longRule || (runs[i] > shortRule && !inZone(yPt, 0))
     const last = raw[raw.length - 1]
-    const rule = runs[i] > ruleLen
     if (last && i - last.bottom <= gap) {
       last.bottom = i
       last.ink += counts[i]
@@ -223,25 +268,35 @@ function analyzeRegion(r: PageRaster, rect: Rect, lines: Line[], ctx: Ctx): Bloc
       last.rule ||= rule
     } else raw.push({ top: i, bottom: i, ink: counts[i], offLine: off, rule })
   }
-  // A band is a figure when a real chunk of it lies away from every text line;
-  // otherwise it's inline math (including fraction parts poking above/below a line).
+  // A band is a figure when a real chunk of it lies away from every text line (or it has
+  // rules); otherwise it's inline math, including fraction parts poking above/below a line.
   const figures = raw
     .filter((b) => b.ink > 40 && (b.offLine / RS >= 3 || b.rule))
     .map((b) => ({ top: (b.top + y0) / RS, bottom: (b.bottom + y0 + 1) / RS }))
 
   // 2. Which lines belong to a figure.
-  const margin = Math.min(...sorted.map((l) => l.x0).filter(Number.isFinite), rect.left + 4)
+  const xs = sorted.map((l) => textX0(l, rect)).filter(Number.isFinite)
+  const margin = xs.length ? Math.min(...xs) : rect.left
+  const width = rect.right - rect.left
   const inFig = sorted.map((l) => figures.some((f) => l.top < f.bottom && l.bottom > f.top))
   for (let changed = true; changed; ) {
     changed = false
     sorted.forEach((l, i) => {
-      if (inFig[i] || l.x0 - margin < 6) return
-      // Titles, legends and axis labels aren't flush-left; pull them in when they're close.
+      if (inFig[i]) return
       const reach = l.size * 3.2
       const near =
         sorted.some((o, j) => inFig[j] && Math.abs(o.baseline - l.baseline) < reach) ||
         figures.some((f) => l.top < f.bottom + reach && l.bottom > f.top - reach)
-      if (near) inFig[i] = changed = true
+      if (!near) return
+      // Titles, legends and axis labels: not flush-left, or a short caption with no end punctuation.
+      const indented = textX0(l, rect) - margin >= 6
+      const caption = l.x1 - l.x0 < width * 0.6 && !/[.?!:;,"”_]$/.test(l.text)
+      // Table rows: a line with a rule just above and just below it.
+      const hug = l.size * 1.2
+      const sandwiched =
+        figures.some((f) => f.bottom <= l.top + 1 && l.top - f.bottom < hug) &&
+        figures.some((f) => f.top >= l.bottom - 1 && f.top - l.bottom < hug)
+      if (indented || caption || sandwiched) inFig[i] = changed = true
     })
   }
 
@@ -367,6 +422,19 @@ function linePieces(r: PageRaster, rect: Rect, line: Line, prev: Line | undefine
       pieces.push({ kind: 'text', it, x: it.x })
       return
     }
+    // Real-font exports reserve a space item under each superscript ("(␣⁸⁷Sr/␣⁸⁶Sr)"); keep
+    // only the part of it that sticks out past the script.
+    const scripts = items.filter((i) => i.script && i.x < it.x + it.w && i.x + i.w > it.x)
+    if (scripts.length > 0) {
+      const thr = line.size * 0.15
+      if (scripts[0].x - it.x > thr) pieces.push({ kind: 'space', x: it.x })
+      const end = Math.max(...scripts.map((i) => i.x + i.w))
+      // These space items can run into the next glyph, so measure only up to it.
+      const nextGlyph = items.slice(k + 1).find((i) => !i.isSpace && !i.script)
+      const spaceEnd = Math.min(it.x + it.w, nextGlyph ? nextGlyph.x : Infinity)
+      if (spaceEnd - end > thr) pieces.push({ kind: 'space', x: end })
+      return
+    }
     const inside = maths.filter((m) => m.x1 > it.x && m.x0 < it.x + it.w)
     if (inside.length === 0) {
       pieces.push({ kind: 'space', x: it.x })
@@ -387,29 +455,54 @@ function linesToParagraphs(r: PageRaster, rect: Rect, lines: Line[], allText: Li
   if (lines.length === 0) return []
   const spacings = allText.slice(1).map((l, i) => l.baseline - allText[i].baseline).filter((d) => d > 2)
   const typical = spacings.length ? Math.min(...spacings) : lines[0].size * 1.6
+  // Verse and block quotes are indented in Reading and Writing passages; keep their line breaks.
+  // (Math lines can start with an image, which makes text look indented, so only RW.)
+  const margin = Math.min(...allText.map((l) => textX0(l, rect)))
+  const indented = (l: Line) => ctx.section === 'rw' && textX0(l, rect) - margin >= 10
   const paras: Line[][] = []
   lines.forEach((l, i) => {
     const prev = lines[i - 1]
-    const newPara = !prev || prev.page !== l.page || l.baseline - prev.baseline > typical * 1.5 || /^[•●▪]/.test(l.text)
+    const newPara =
+      !prev ||
+      prev.page !== l.page ||
+      l.baseline - prev.baseline > typical * 1.5 ||
+      /^[•●▪]/.test(l.text) ||
+      indented(l) !== indented(prev)
     if (newPara) paras.push([l])
     else paras[paras.length - 1].push(l)
   })
   return paras
-    .map((pl) => ({
-      id: `${ctx.qid}-p${ctx.counter.n++}`,
-      runs: lineRuns(pl, (l) => {
-        const k = allText.indexOf(l)
-        return linePieces(r, rect, l, allText[k - 1], allText[k + 1])
-      }, ctx.regularFont, (it, l) => looksItalic(r, it, l.size)),
-    }))
+    .map((pl) => {
+      const verse = pl.length > 1 && pl.every(indented)
+      return {
+        id: `${ctx.qid}-p${ctx.counter.n++}`,
+        ...(verse ? { indent: true } : {}),
+        runs: lineRuns(
+          pl,
+          (l) => {
+            const k = allText.indexOf(l)
+            return linePieces(r, rect, l, allText[k - 1], allText[k + 1])
+          },
+          ctx.regularFont,
+          (it, l) => looksItalic(r, it, l.size),
+          verse ? '\n' : ' ',
+        ),
+      }
+    })
     .filter((p) => p.runs.length > 0)
 }
 
-function lineRuns(lines: Line[], piecesOf: (l: Line) => Piece[], regularFont: string | null, italic: (it: TItem, line: Line) => boolean): Run[] {
+function lineRuns(
+  lines: Line[],
+  piecesOf: (l: Line) => Piece[],
+  regularFont: string | null,
+  italic: (it: TItem, line: Line) => boolean,
+  lineJoin: ' ' | '\n' = ' ',
+): Run[] {
   const runs: Run[] = []
   const push = (text: string, style: Omit<Run, 'text'> = {}) => {
     const last = runs[runs.length - 1]
-    if (!style.img && last && !last.img && !!last.italic === !!style.italic && !!last.bold === !!style.bold) last.text += text
+    if (!style.img && last && !last.img && !!last.italic === !!style.italic && !!last.bold === !!style.bold && last.script === style.script) last.text += text
     else runs.push({ text, ...style })
   }
   lines.forEach((line, li) => {
@@ -420,6 +513,7 @@ function lineRuns(lines: Line[], piecesOf: (l: Line) => Piece[], regularFont: st
     let prevEnd = -Infinity
     let prevKind: Piece['kind'] | null = null
     let prevText = ''
+    let prevScript = false
     for (const p of pieces) {
       if (p.kind === 'space') {
         push(' ')
@@ -430,23 +524,30 @@ function lineRuns(lines: Line[], piecesOf: (l: Line) => Piece[], regularFont: st
         prevEnd = p.x1
       } else {
         const it = p.it
-        if (prevKind === 'text' && it.x - prevEnd > it.size * 0.2) push(' ')
+        if (prevKind === 'text' && !it.script && !prevScript && it.x - prevEnd > it.size * 0.2) push(' ')
         // Math at the start of a wrapped line has no space item after it; overhang keeps real
         // touching pairs under ~1pt, so a clear gap before a word means a space.
         if (prevKind === 'img' && /^[A-Za-z0-9]/.test(it.str) && it.x - prevEnd > it.size * 0.08) push(' ')
-        const style = heading
+        const style: Omit<Run, 'text'> = heading
           ? { bold: true }
           : { italic: regularFont !== null && it.font !== regularFont && /[A-Za-z].*[A-Za-z]/.test(it.str) && italic(it, line) }
+        if (it.script) style.script = it.script
         push(it.str, style)
         prevEnd = it.x + it.w
         prevText = it.str
+        prevScript = !!it.script
       }
       prevKind = p.kind
     }
-    if (li < lines.length - 1 && !/[—-]$/.test(line.text)) push(' ')
+    if (li < lines.length - 1) {
+      if (lineJoin === '\n') push('\n')
+      else if (!/[—-]$/.test(line.text)) push(' ')
+    }
   })
   // Collapse whitespace.
-  const cleaned = runs.map((r) => (r.img ? r : { ...r, text: r.text.replace(/\s+/g, ' ') })).filter((r) => r.text.length > 0)
+  const cleaned = runs
+    .map((r) => (r.img ? r : { ...r, text: r.text.replace(/[^\S\n]+/g, ' ').replace(/ ?\n ?/g, '\n') }))
+    .filter((r) => r.text.length > 0)
   if (cleaned[0] && !cleaned[0].img) cleaned[0] = { ...cleaned[0], text: cleaned[0].text.trimStart() }
   const last = cleaned.length - 1
   if (cleaned[last] && !cleaned[last].img) cleaned[last] = { ...cleaned[last], text: cleaned[last].text.trimEnd() }
@@ -514,7 +615,7 @@ function planQuestion(s: QuestionSkeleton, work: Map<number, (r: PageRaster) => 
     const prev = work.get(page)
     work.set(page, prev ? (r) => (prev(r), fn(r)) : fn)
   }
-  const ctx: Ctx = { qid: s.id, regularFont: s.regularFont, counter: { n: 0 } }
+  const ctx: Ctx = { qid: s.id, section: s.section, regularFont: s.regularFont, counter: { n: 0 } }
   const stemBlocks: Block[][] = s.stem.map(() => [])
   const choiceBlocks: Block[][][] = (s.choices ?? []).map((c) => c.segments.map(() => []))
   const rationale: Block[][] = s.rationale.map(() => [])

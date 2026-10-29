@@ -24,12 +24,15 @@ export interface Run {
   text: string
   italic?: boolean
   bold?: boolean
+  script?: 'sup' | 'sub'
   img?: InlineImage
 }
 
 export interface Paragraph {
   id: string
   runs: Run[]
+  /** Verse or a block quote: indented, with its line breaks kept. */
+  indent?: boolean
 }
 
 export type Block =

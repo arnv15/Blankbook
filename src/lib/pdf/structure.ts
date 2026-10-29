@@ -76,46 +76,67 @@ function buildOne(L: Line[], pages: PageInfo[]): QuestionSkeleton {
   const left = Math.max(0, margin - 3)
 
   const headerIdx = L.findIndex((l) => /Assessment/.test(l.text) && /Difficulty/.test(l.text))
-  const qIdx = L.findIndex((l, i) => i > headerIdx && l.text === 'Question')
-  if (qIdx < 0) throw new ParseError(`Question ${id}: couldn't find the "Question" label.`)
-  const labelFont = lineFont(L[qIdx])
-  const isLabel = (l: Line, text: string) => l.text === text && lineFont(l) === labelFont
+  // Two export layouts exist: one labels the stem "Question" and the choices "Answer";
+  // the other opens the stem with "ID: <id>" and closes the choices with "ID: <id> Answer".
+  const idLine = new RegExp(`^ID:?\\s*${id}$`, 'i')
+  const idAnswerLine = new RegExp(`^ID:?\\s*${id}\\s+Answer$`, 'i')
+  const qIdx = L.findIndex((l, i) => i > headerIdx && (l.text === 'Question' || idLine.test(l.text)))
+  if (qIdx < 0) throw new ParseError(`Question ${id}: couldn't find where the question starts.`)
+  const labelFont = L[qIdx].text === 'Question' ? lineFont(L[qIdx]) : null
+  const isLabel = (l: Line, text: string) => l.text === text && (labelFont === null || lineFont(l) === labelFont)
   const after = (pred: (l: Line) => boolean) => {
     const i = L.findIndex((l, j) => j > qIdx && pred(l))
     return i < 0 ? null : i
   }
   const aIdx = after((l) => isLabel(l, 'Answer'))
+  const markerIdx = after((l) => idAnswerLine.test(l.text))
   const cIdx = after((l) => /^Correct Answer:/.test(l.text))
   const rIdx = after((l) => isLabel(l, 'Rationale'))
+  const diffIdx = after((l) => /^Question Difficulty:/.test(l.text))
 
   const meta = parseMeta(L, headerIdx, qIdx)
+  if (!meta.difficulty && diffIdx !== null) meta.difficulty = L[diffIdx].text.replace(/^Question Difficulty:\s*/, '').trim()
   const section: SectionKind = /math/i.test(meta.test) ? 'math' : 'rw'
-
   const right = (p: number) => pages[p].width - left
-  const stemEndIdx = firstOf(aIdx, cIdx, rIdx)
-  const stem = between(L, L[qIdx], stemEndIdx === null ? null : L[stemEndIdx], left, right, pages)
 
-  // Choices: "A."…"D." labels flush with the left margin, in order.
+  // Choices: "A."…"D." labels near the left margin, in order.
+  const choicesEnd = firstOf(markerIdx, cIdx, rIdx)
+  // Measure the margin from the body, not the title (which can sit further left).
+  const bodyMargin = Math.min(...L.slice(qIdx + 1).map((l) => l.x0))
+  const labelIdxs: number[] = []
+  for (let i = (aIdx ?? qIdx) + 1; i < (choicesEnd ?? L.length); i++) {
+    const m = CHOICE_RE.exec(L[i].text)
+    if (m && m[1] === LETTERS[labelIdxs.length] && L[i].x0 - bodyMargin < 8) labelIdxs.push(i)
+  }
+  const hasChoices = labelIdxs.length >= 2
+
+  const stemEndIdx = aIdx ?? (hasChoices ? labelIdxs[0] : choicesEnd)
+  // The "ID: …" labels are white text in a filled box that overhangs the text; stay clear of it.
+  const boxPad = (l: Line) => (idLine.test(l.text) || idAnswerLine.test(l.text) ? l.size * 0.8 : 0)
+  const stemFrom = L[qIdx]
+  const stemTo = stemEndIdx === null ? null : L[stemEndIdx]
+  const stem = segmentsFor(
+    L,
+    stemFrom.page,
+    stemFrom.bottom + 1 + boxPad(stemFrom),
+    stemTo ? stemTo.page : L[L.length - 1].page,
+    stemTo ? (hasChoices && stemEndIdx === labelIdxs[0] ? midGap(L, stemEndIdx) : stemTo.top - 1 - boxPad(stemTo)) : null,
+    left,
+    right,
+    pages,
+  )
+
   let choices: ChoiceSkeleton[] | null = null
-  const choiceFrom = aIdx ?? stemEndIdx
-  if (choiceFrom !== null) {
-    const choiceEnd = firstOf(cIdx, rIdx)
-    const labelIdxs: number[] = []
-    for (let i = choiceFrom; i < (choiceEnd ?? L.length); i++) {
-      const m = CHOICE_RE.exec(L[i].text)
-      if (m && m[1] === LETTERS[labelIdxs.length] && L[i].x0 - margin < 4) labelIdxs.push(i)
-    }
-    if (labelIdxs.length >= 2) {
-      choices = labelIdxs.map((li, k) => {
-        const label = L[li]
-        const prevBottom = k === 0 ? L[choiceFrom].bottom : null
-        const nextIdx = k + 1 < labelIdxs.length ? labelIdxs[k + 1] : choiceEnd
-        const startY = prevBottom ?? midGap(L, li)
-        const endY = nextIdx === null ? null : k + 1 < labelIdxs.length ? midGap(L, nextIdx) : L[nextIdx].top - 1
-        const segs = segmentsFor(L, label.page, startY, nextIdx === null ? L[L.length - 1].page : L[nextIdx].page, endY, left, right, pages)
-        return { letter: LETTERS[k], segments: segs, contentLeft: labelEnd(label) + 2 }
-      })
-    }
+  if (hasChoices) {
+    choices = labelIdxs.map((li, k) => {
+      const label = L[li]
+      const startY = k === 0 && aIdx !== null ? L[aIdx].bottom : midGap(L, li)
+      const nextIdx = k + 1 < labelIdxs.length ? labelIdxs[k + 1] : choicesEnd
+      const endY = nextIdx === null ? null : k + 1 < labelIdxs.length ? midGap(L, nextIdx) : L[nextIdx].top - 1 - boxPad(L[nextIdx])
+      const startPage = k === 0 && aIdx !== null ? L[aIdx].page : label.page
+      const segs = segmentsFor(L, startPage, startY, nextIdx === null ? L[L.length - 1].page : L[nextIdx].page, endY, left, right, pages)
+      return { letter: LETTERS[k], segments: segs, contentLeft: labelEnd(label) + 2 }
+    })
   }
 
   let correctText: string | null = null
@@ -125,8 +146,7 @@ function buildOne(L: Line[], pages: PageInfo[]): QuestionSkeleton {
     correctText = L[cIdx].text.replace(/^Correct Answer:\s*/, '').trim()
   }
 
-  const rationale =
-    rIdx === null ? [] : between(L, L[rIdx], null, left, right, pages)
+  const rationale = rIdx === null ? [] : between(L, L[rIdx], diffIdx === null ? null : L[diffIdx], left, right, pages)
 
   return {
     id,
@@ -216,9 +236,14 @@ function parseMeta(L: Line[], headerIdx: number, qIdx: number) {
     if (word.length) cols.push({ name: joinItems(word).toLowerCase(), x: word[0].x })
     word = []
   }
+  // Columns are split by space items or, in exports without them, by a wide gap.
   for (const it of L[headerIdx].items) {
     if (it.isSpace) flush()
-    else word.push(it)
+    else {
+      const prev = word[word.length - 1]
+      if (prev && it.x - (prev.x + prev.w) > it.size * 1.5) flush()
+      word.push(it)
+    }
   }
   flush()
 
